@@ -1,0 +1,14 @@
+{
+  "name": "genkit-ai-sdk-transport-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace=server",
+    "dev:web": "npm run dev --workspace=web"
+  }
+}

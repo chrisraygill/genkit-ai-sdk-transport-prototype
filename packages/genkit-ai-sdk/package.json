@@ -1,0 +1,16 @@
+{
+  "name": "@genkit-aisdk-proto/transport",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@genkit-aisdk-proto/chunk-reducer": "*",
+    "ai": "^6.0.0",
+    "genkit": "^1.35.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}
