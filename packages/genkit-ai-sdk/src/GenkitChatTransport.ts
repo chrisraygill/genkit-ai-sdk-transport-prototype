@@ -68,33 +68,35 @@ export class GenkitChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
 
     return new ReadableStream<UIMessageChunk>({
       async start(controller) {
-        const textBlockId = `text-${cryptoRandomId()}`;
-        let textOpen = false;
-        const reasoningBlockId = `reasoning-${cryptoRandomId()}`;
-        let reasoningOpen = false;
-        // Track which tool input streaming blocks have been opened so we know
-        // whether to emit tool-input-start before tool-input-delta.
-        const openToolInputs = new Set<string>();
+        // A *fresh* id per block so text → tool → text produces two
+        // distinct text blocks with correct start/end lifetimes, not a
+        // single text block whose end is delayed past the tool call.
+        let textBlockId: string | null = null;
+        let reasoningBlockId: string | null = null;
 
-        function closeOpenBlocks() {
-          if (textOpen) {
+        function closeTextBlock() {
+          if (textBlockId) {
             controller.enqueue({ type: 'text-end', id: textBlockId });
-            textOpen = false;
+            textBlockId = null;
           }
-          if (reasoningOpen) {
+        }
+        function closeReasoningBlock() {
+          if (reasoningBlockId) {
             controller.enqueue({ type: 'reasoning-end', id: reasoningBlockId });
-            reasoningOpen = false;
+            reasoningBlockId = null;
           }
         }
 
         try {
           for await (const chunk of stream) {
             for (const part of chunk.content ?? []) {
-              // Text deltas.
+              // Text deltas: continue the current block, or open a fresh
+              // one if a tool/reasoning part closed the previous one.
               if (typeof part.text === 'string' && part.text.length > 0) {
-                if (!textOpen) {
+                closeReasoningBlock();
+                if (!textBlockId) {
+                  textBlockId = `text-${cryptoRandomId()}`;
                   controller.enqueue({ type: 'text-start', id: textBlockId });
-                  textOpen = true;
                 }
                 controller.enqueue({
                   type: 'text-delta',
@@ -103,14 +105,15 @@ export class GenkitChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
                 });
               }
 
-              // Reasoning deltas.
+              // Reasoning deltas: same pattern.
               if (typeof part.reasoning === 'string' && part.reasoning.length > 0) {
-                if (!reasoningOpen) {
+                closeTextBlock();
+                if (!reasoningBlockId) {
+                  reasoningBlockId = `reasoning-${cryptoRandomId()}`;
                   controller.enqueue({
                     type: 'reasoning-start',
                     id: reasoningBlockId,
                   });
-                  reasoningOpen = true;
                 }
                 controller.enqueue({
                   type: 'reasoning-delta',
@@ -119,41 +122,40 @@ export class GenkitChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
                 });
               }
 
-              // Tool requests.
+              // Tool requests. A tool call always breaks any open text or
+              // reasoning block — close them before emitting the tool part
+              // so part order in the resulting UIMessage stays sane.
+              //
+              // Note on partial inputs: Genkit's ToolRequestPart has a
+              // `partial: true` flag for providers that stream tool args
+              // token by token, but the per-chunk shape is a *parsed
+              // cumulative* object, while Vercel's `tool-input-delta` is
+              // *text-suffix* JSON to be concatenated. Translating the
+              // former to the latter correctly requires diffing successive
+              // partial objects. For now we collapse partials: each
+              // partial chunk re-emits a fresh `tool-input-available` with
+              // the latest cumulative input. UIs that latch on
+              // `tool-input-available` will see the input only when
+              // settled; UIs that diff updates will see progressive
+              // updates. Worth revisiting once a provider in active use
+              // actually emits partials.
               if (part.toolRequest) {
-                const { name, input, ref, partial } = part.toolRequest;
+                closeTextBlock();
+                closeReasoningBlock();
+                const { name, input, ref } = part.toolRequest;
                 const toolCallId = ref ?? `${name}-${cryptoRandomId()}`;
-
-                if (partial) {
-                  // Streaming partial args: open the input block if needed,
-                  // then emit a delta carrying the JSON-encoded partial input.
-                  if (!openToolInputs.has(toolCallId)) {
-                    controller.enqueue({
-                      type: 'tool-input-start',
-                      toolCallId,
-                      toolName: name,
-                    });
-                    openToolInputs.add(toolCallId);
-                  }
-                  controller.enqueue({
-                    type: 'tool-input-delta',
-                    toolCallId,
-                    inputTextDelta: JSON.stringify(input ?? {}),
-                  });
-                } else {
-                  // Full input available in one shot.
-                  controller.enqueue({
-                    type: 'tool-input-available',
-                    toolCallId,
-                    toolName: name,
-                    input: input ?? {},
-                  });
-                  openToolInputs.delete(toolCallId);
-                }
+                controller.enqueue({
+                  type: 'tool-input-available',
+                  toolCallId,
+                  toolName: name,
+                  input: input ?? {},
+                });
               }
 
               // Tool responses.
               if (part.toolResponse) {
+                closeTextBlock();
+                closeReasoningBlock();
                 const { ref, name, output } = part.toolResponse;
                 const toolCallId = ref ?? `${name}-${cryptoRandomId()}`;
                 controller.enqueue({
@@ -164,10 +166,12 @@ export class GenkitChatTransport<UI_MESSAGE extends UIMessage = UIMessage>
               }
             }
           }
-          closeOpenBlocks();
+          closeTextBlock();
+          closeReasoningBlock();
           controller.close();
         } catch (err) {
-          closeOpenBlocks();
+          closeTextBlock();
+          closeReasoningBlock();
           controller.enqueue({
             type: 'error',
             errorText: err instanceof Error ? err.message : String(err),
